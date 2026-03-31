@@ -76,8 +76,14 @@ df["DoC_next"] = df.groupby("sample_id")["Degree_of_Cure"].shift(-1)
 # Drop last row of each sample, since DoC_next is undefined there
 df = df.dropna(subset=["DoC_next"]).copy()
 
+# New target: incremental cure change
+df["delta_DoC"] = df["DoC_next"] - df["Degree_of_Cure"]
+
 print("\nAfter creating DoC_next:")
-print(df[["sample_id", "Time", "Temperature", "Sensor_Value", "Degree_of_Cure", "DoC_next"]].head())
+print(df[[
+    "sample_id", "Time", "Temperature", "Sensor_Value",
+    "Degree_of_Cure", "DoC_next", "delta_DoC"
+]].head())
 
 # ------------------------------------------------------------
 # 3. Train/test split (BY SAMPLE, NOT ROW)
@@ -102,16 +108,20 @@ print("Testing rows:", len(test_df))
 
 # ------------------------------------------------------------
 # 4. Select features and target
-#    Model: DoC_next = f(Temperature, Degree_of_Cure, Sensor_Value)
+#    Model: delta_DoC = f(Temperature, Degree_of_Cure, Sensor_Value, Time)
 # ------------------------------------------------------------
 feature_cols = ["Temperature", "Degree_of_Cure", "Sensor_Value", "Time"]
-target_col = "DoC_next"
+target_col = "delta_DoC"
 
 X_train = train_df[feature_cols].values
 y_train = train_df[target_col].values
 
 X_test = test_df[feature_cols].values
 y_test = test_df[target_col].values
+
+# keep true next-step DoC separately for evaluation/plots
+y_train_next = train_df["DoC_next"].values
+y_test_next = test_df["DoC_next"].values
 
 print("\nX_train shape:", X_train.shape)
 print("X_test shape:", X_test.shape)
@@ -147,35 +157,43 @@ model.fit(X_train_scaled, y_train)
 # ------------------------------------------------------------
 # 8. Predict
 # ------------------------------------------------------------
-y_pred = model.predict(X_test_scaled)
-train_pred = model.predict(X_train_scaled)
+delta_pred = model.predict(X_test_scaled)
+delta_train_pred = model.predict(X_train_scaled)
+
+# convert delta -> next-step DoC
+y_pred = X_test[:, 1] + delta_pred
+train_pred = X_train[:, 1] + delta_train_pred
+
+# true next-step DoC for evaluation
+y_test_next = test_df["DoC_next"].values
+y_train_next = train_df["DoC_next"].values
 
 # ------------------------------------------------------------
 # 9. Evaluate
 # ------------------------------------------------------------
-mse = mean_squared_error(y_test, y_pred)
+mse = mean_squared_error(y_test_next, y_pred)
 rmse = np.sqrt(mse)
-mae = mean_absolute_error(y_test, y_pred)
-r2 = r2_score(y_test, y_pred)
+mae = mean_absolute_error(y_test_next, y_pred)
+r2 = r2_score(y_test_next, y_pred)
 
 print("\nModel: MLP Regressor")
-print("Task: Predict next-step Degree of Cure")
+print("Task: Predict next-step change in Degree of Cure (delta_DoC)")
 print(f"MAE  = {mae:.6f}")
 print(f"RMSE = {rmse:.6f}")
 print(f"R^2  = {r2:.6f}")
 
 print("\nOverfitting check:")
-print(f"Train R^2 = {r2_score(y_train, train_pred):.6f}")
+print(f"Train R^2 = {r2_score(y_train_next, train_pred):.6f}")
 print(f"Test  R^2 = {r2:.6f}")
 
 # ------------------------------------------------------------
 # 10. Naive baseline: DoC_next = current DoC
 # ------------------------------------------------------------
-baseline_pred = X_test[:, 1]  # current Degree_of_Cure
+baseline_pred = X_test[:, 1]
 
-baseline_rmse = np.sqrt(mean_squared_error(y_test, baseline_pred))
-baseline_mae = mean_absolute_error(y_test, baseline_pred)
-baseline_r2 = r2_score(y_test, baseline_pred)
+baseline_rmse = np.sqrt(mean_squared_error(y_test_next, baseline_pred))
+baseline_mae = mean_absolute_error(y_test_next, baseline_pred)
+baseline_r2 = r2_score(y_test_next, baseline_pred)
 
 print("\nNaive baseline: DoC_next = current DoC")
 print(f"Baseline MAE  = {baseline_mae:.6f}")
@@ -186,10 +204,10 @@ print(f"Baseline R^2  = {baseline_r2:.6f}")
 # 11. Plot actual vs predicted next-step DoC
 # ------------------------------------------------------------
 plt.figure(figsize=(7, 5))
-plt.scatter(y_test, y_pred, alpha=0.3)
+plt.scatter(y_test_next, y_pred, alpha=0.3)
 plt.plot(
-    [y_test.min(), y_test.max()],
-    [y_test.min(), y_test.max()],
+    [y_test_next.min(), y_test_next.max()],
+    [y_test_next.min(), y_test_next.max()],
     'k--',
     linewidth=1
 )
@@ -205,7 +223,7 @@ plt.show()
 # ------------------------------------------------------------
 test_results = pd.DataFrame({
     "Current_DoC": X_test[:, 1],
-    "Actual_DoC_next": y_test,
+    "Actual_DoC_next": y_test_next,
     "Predicted_DoC_next": y_pred
 }).sort_values("Current_DoC")
 
@@ -234,11 +252,10 @@ plt.show()
 
 # ------------------------------------------------------------
 # 13. Plot S-curves using RECURSIVE rollout
-#     (model feeds on its own predicted DoC)
+#     (delta_DoC model)
 # ------------------------------------------------------------
 plt.figure(figsize=(10, 6))
 
-# pick a few random test samples
 sample_ids_to_plot = np.random.choice(
     test_df["sample_id"].unique(),
     size=5,
@@ -254,33 +271,34 @@ for sid in sample_ids_to_plot:
     sensor_vals = sample["Sensor_Value"].values
     actual_doc = sample["Degree_of_Cure"].values
 
-    # Start rollout from the TRUE initial DoC
+    # start from true initial DoC
     current_doc = actual_doc[0]
-
     predicted_doc_curve = [current_doc]
 
-    # Step forward recursively
     for i in range(1, len(sample)):
-        x_input = np.array([[temp_vals[i-1], current_doc, sensor_vals[i-1], time_vals[i-1]]])
+        x_input = np.array([[
+            temp_vals[i-1],
+            current_doc,
+            sensor_vals[i-1],
+            time_vals[i-1]
+        ]])
+
         x_input_scaled = x_scaler.transform(x_input)
+        delta_doc_pred = model.predict(x_input_scaled)[0]
 
-        next_doc_pred = model.predict(x_input_scaled)[0]
+        # physics constraint: increment cannot be negative
+        delta_doc_pred = max(delta_doc_pred, 0)
 
-         # --- PHYSICS CONSTRAINTS ---
-        next_doc_pred = max(next_doc_pred, current_doc)  # no decrease
-        next_doc_pred = min(next_doc_pred, 100)          # cap at full cure
-
-        # Optional safety clamp to keep DoC physical
-        next_doc_pred = np.clip(next_doc_pred, 0, 100)
+        next_doc_pred = current_doc + delta_doc_pred
+        next_doc_pred = min(next_doc_pred, 100)
 
         predicted_doc_curve.append(next_doc_pred)
-
-        # Feed prediction back in
         current_doc = next_doc_pred
 
     predicted_doc_curve = np.array(predicted_doc_curve)
 
-    # Plot actual
+    print(f"{sid}: len(time_vals)={len(time_vals)}, len(predicted_doc_curve)={len(predicted_doc_curve)}")
+
     actual_line, = plt.plot(
         time_vals,
         actual_doc,
@@ -288,7 +306,6 @@ for sid in sample_ids_to_plot:
         label=f"{sid} Actual"
     )
 
-    # Plot recursive prediction in matching color
     plt.plot(
         time_vals,
         predicted_doc_curve,
@@ -305,4 +322,3 @@ plt.grid(True)
 plt.legend(fontsize=8, ncol=2)
 plt.tight_layout()
 plt.show()
-
