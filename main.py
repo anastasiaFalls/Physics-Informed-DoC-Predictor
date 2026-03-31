@@ -104,7 +104,7 @@ print("Testing rows:", len(test_df))
 # 4. Select features and target
 #    Model: DoC_next = f(Temperature, Degree_of_Cure, Sensor_Value)
 # ------------------------------------------------------------
-feature_cols = ["Temperature", "Degree_of_Cure", "Sensor_Value"]
+feature_cols = ["Temperature", "Degree_of_Cure", "Sensor_Value", "Time"]
 target_col = "DoC_next"
 
 X_train = train_df[feature_cols].values
@@ -232,11 +232,11 @@ plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-
 # ------------------------------------------------------------
-# 13. Plot S-curves (Actual vs Predicted over Time)
+# 13. Plot S-curves using RECURSIVE rollout
+#     (model feeds on its own predicted DoC)
 # ------------------------------------------------------------
-plt.figure(figsize=(8, 5))
+plt.figure(figsize=(10, 6))
 
 # pick a few random test samples
 sample_ids_to_plot = np.random.choice(
@@ -247,33 +247,62 @@ sample_ids_to_plot = np.random.choice(
 
 for sid in sample_ids_to_plot:
     sample = test_df[test_df["sample_id"] == sid].copy()
-    sample = sample.sort_values("Time")
+    sample = sample.sort_values("Time").reset_index(drop=True)
 
-    # Predict step-by-step (one-step predictions)
-    X_sample = sample[feature_cols].values
-    X_sample_scaled = x_scaler.transform(X_sample)
-    pred_next = model.predict(X_sample_scaled)
+    time_vals = sample["Time"].values
+    temp_vals = sample["Temperature"].values
+    sensor_vals = sample["Sensor_Value"].values
+    actual_doc = sample["Degree_of_Cure"].values
 
-    # Plot actual DoC
-    plt.plot(
-        sample["Time"],
-        sample["Degree_of_Cure"],
-        label=f"{sid} (Actual)",
-        linestyle='-'
+    # Start rollout from the TRUE initial DoC
+    current_doc = actual_doc[0]
+
+    predicted_doc_curve = [current_doc]
+
+    # Step forward recursively
+    for i in range(1, len(sample)):
+        x_input = np.array([[temp_vals[i-1], current_doc, sensor_vals[i-1], time_vals[i-1]]])
+        x_input_scaled = x_scaler.transform(x_input)
+
+        next_doc_pred = model.predict(x_input_scaled)[0]
+
+         # --- PHYSICS CONSTRAINTS ---
+        next_doc_pred = max(next_doc_pred, current_doc)  # no decrease
+        next_doc_pred = min(next_doc_pred, 100)          # cap at full cure
+
+        # Optional safety clamp to keep DoC physical
+        next_doc_pred = np.clip(next_doc_pred, 0, 100)
+
+        predicted_doc_curve.append(next_doc_pred)
+
+        # Feed prediction back in
+        current_doc = next_doc_pred
+
+    predicted_doc_curve = np.array(predicted_doc_curve)
+
+    # Plot actual
+    actual_line, = plt.plot(
+        time_vals,
+        actual_doc,
+        linewidth=2,
+        label=f"{sid} Actual"
     )
 
-    # Plot predicted next-step DoC
+    # Plot recursive prediction in matching color
     plt.plot(
-        sample["Time"],
-        pred_next,
-        linestyle='--'
+        time_vals,
+        predicted_doc_curve,
+        linestyle='--',
+        linewidth=2,
+        color=actual_line.get_color(),
+        label=f"{sid} Predicted"
     )
 
 plt.xlabel("Time")
 plt.ylabel("Degree of Cure")
-plt.title("Actual vs Predicted Cure Evolution (S-Curves)")
+plt.title("Actual vs Predicted Cure Evolution (Recursive Rollout)")
 plt.grid(True)
+plt.legend(fontsize=8, ncol=2)
 plt.tight_layout()
 plt.show()
-
 
