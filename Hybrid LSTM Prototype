@@ -88,26 +88,25 @@ class Config:
     num_layers: int = 2
     dropout: float = 0.10
     learning_rate: float = 1e-3
-    epochs: int = 80
+    epochs: int = 10
 
     # Loss weights
-    w_data: float = 1.00
-    w_iso: float = 0.25
-    w_monotonic: float = 0.15
-    w_bounds: float = 0.10
-    w_kinetics: float = 0.10
-    w_uncertainty: float = 0.01
+    w_data = 1.00
+    w_iso = 0.00
+    w_monotonic = 0.05
+    w_bounds = 0.00
+    w_kinetics = 0.00
+    w_uncertainty = 0.001
 
     # Abnormal flag thresholds
     min_final_doc: float = 0.85
     max_final_doc: float = 1.02
     safe_temp_c: float = 180.0
     burn_temp_c: float = 220.0
-    max_doc_rate_per_min: float = 0.08
+    max_doc_rate_per_min = 0.20
+    s_curve_rmse_threshold = 0.30   
     min_doc_rate_mid_cure: float = 0.001
     early_plateau_doc: float = 0.70
-    s_curve_rmse_threshold: float = 0.12
-
 
 CFG = Config()
 
@@ -1270,4 +1269,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
