@@ -48,6 +48,7 @@ from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 
 
 # ============================================================
@@ -659,6 +660,40 @@ def split_sample_ids(df, train_frac=0.75, val_frac=0.10):
     return train_ids, val_ids, test_ids
 
 
+def cure_collate_fn(batch):
+    """
+    Custom collate function for variable-length cure sequences.
+
+    Different CSVs can have different numbers of time points, e.g. [633, 3]
+    and [721, 3]. PyTorch's default DataLoader cannot stack those directly.
+    This pads each sequence to the longest sequence in the batch and returns
+    a mask so padded regions can be ignored in the loss.
+    """
+    sample_ids = [item["sample_id"] for item in batch]
+    lengths = torch.tensor([item["x"].shape[0] for item in batch], dtype=torch.long)
+
+    x = pad_sequence([item["x"] for item in batch], batch_first=True, padding_value=0.0)
+    y = pad_sequence([item["y"] for item in batch], batch_first=True, padding_value=0.0)
+    iso = pad_sequence([item["iso"] for item in batch], batch_first=True, padding_value=0.0)
+    time = pad_sequence([item["time"] for item in batch], batch_first=True, padding_value=0.0)
+    temp = pad_sequence([item["temp"] for item in batch], batch_first=True, padding_value=0.0)
+
+    max_len = x.shape[1]
+    mask = torch.arange(max_len).unsqueeze(0) < lengths.unsqueeze(1)
+    mask = mask.unsqueeze(-1).float()
+
+    return {
+        "sample_id": sample_ids,
+        "x": x,
+        "y": y,
+        "iso": iso,
+        "time": time,
+        "temp": temp,
+        "mask": mask,
+        "lengths": lengths,
+    }
+
+
 # ============================================================
 # 5. LSTM model with uncertainty output
 # ============================================================
@@ -706,31 +741,49 @@ class LSTMDoCModel(nn.Module):
 # 6. Physics-informed losses
 # ============================================================
 
-def gaussian_nll_loss(pred_mean, pred_log_var, target):
+def masked_mean(values, mask):
+    """Mean over only real, non-padded time points."""
+    return torch.sum(values * mask) / torch.clamp(torch.sum(mask), min=1.0)
+
+
+def gaussian_nll_loss(pred_mean, pred_log_var, target, mask=None):
     """Uncertainty-aware data loss."""
     inv_var = torch.exp(-pred_log_var)
-    return torch.mean(0.5 * inv_var * (target - pred_mean) ** 2 + 0.5 * pred_log_var)
+    values = 0.5 * inv_var * (target - pred_mean) ** 2 + 0.5 * pred_log_var
+    if mask is None:
+        return torch.mean(values)
+    return masked_mean(values, mask)
 
 
-def monotonicity_loss(pred):
+def monotonicity_loss(pred, mask=None):
     """Penalize DoC decreasing with time."""
     delta = pred[:, 1:, :] - pred[:, :-1, :]
-    return torch.mean(torch.relu(-delta))
+    values = torch.relu(-delta)
+    if mask is None:
+        return torch.mean(values)
+    pair_mask = mask[:, 1:, :] * mask[:, :-1, :]
+    return masked_mean(values, pair_mask)
 
 
-def bounds_loss(pred):
+def bounds_loss(pred, mask=None):
     """Penalize predictions outside [0, 1]. Sigmoid already helps, but this is modular."""
     lower = torch.relu(-pred)
     upper = torch.relu(pred - 1.0)
-    return torch.mean(lower**2 + upper**2)
+    values = lower**2 + upper**2
+    if mask is None:
+        return torch.mean(values)
+    return masked_mean(values, mask)
 
 
-def isoconversion_loss(pred, iso):
+def isoconversion_loss(pred, iso, mask=None):
     """Compare predicted trajectory to forward-solver/isoconversion reference."""
-    return torch.mean((pred - iso) ** 2)
+    values = (pred - iso) ** 2
+    if mask is None:
+        return torch.mean(values)
+    return masked_mean(values, mask)
 
 
-def kinetics_rate_loss(pred, iso, time):
+def kinetics_rate_loss(pred, iso, time, mask=None):
     """
     Compare predicted cure rate to reference cure rate.
 
@@ -745,18 +798,23 @@ def kinetics_rate_loss(pred, iso, time):
     pred_rate = (pred[:, 1:, :] - pred[:, :-1, :]) / dt
     iso_rate = (iso[:, 1:, :] - iso[:, :-1, :]) / dt
 
-    return torch.mean((pred_rate - iso_rate) ** 2)
+    values = (pred_rate - iso_rate) ** 2
+    if mask is None:
+        return torch.mean(values)
+    pair_mask = mask[:, 1:, :] * mask[:, :-1, :]
+    return masked_mean(values, pair_mask)
 
 
-def total_loss_fn(pred, log_var, y, iso, time, cfg: Config):
-    data = gaussian_nll_loss(pred, log_var, y)
-    iso_l = isoconversion_loss(pred, iso)
-    mono = monotonicity_loss(pred)
-    bnd = bounds_loss(pred)
-    kin = kinetics_rate_loss(pred, iso, time)
+def total_loss_fn(pred, log_var, y, iso, time, cfg: Config, mask=None):
+    data = gaussian_nll_loss(pred, log_var, y, mask=mask)
+    iso_l = isoconversion_loss(pred, iso, mask=mask)
+    mono = monotonicity_loss(pred, mask=mask)
+    bnd = bounds_loss(pred, mask=mask)
+    kin = kinetics_rate_loss(pred, iso, time, mask=mask)
 
     # Regularize uncertainty so it does not inflate like a cowardly little balloon.
-    unc_reg = torch.mean(torch.exp(log_var))
+    unc_values = torch.exp(log_var)
+    unc_reg = masked_mean(unc_values, mask) if mask is not None else torch.mean(unc_values)
 
     total = (
         cfg.w_data * data
@@ -796,7 +854,9 @@ def train_one_epoch(model, loader, optimizer, cfg):
 
         optimizer.zero_grad()
         pred, log_var = model(x)
-        loss, comps = total_loss_fn(pred, log_var, y, iso, time, cfg)
+        mask = batch.get("mask")
+        mask = mask.to(DEVICE) if mask is not None else None
+        loss, comps = total_loss_fn(pred, log_var, y, iso, time, cfg, mask=mask)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -818,7 +878,9 @@ def evaluate(model, loader, cfg):
             time = batch["time"].to(DEVICE)
 
             pred, log_var = model(x)
-            _, comps = total_loss_fn(pred, log_var, y, iso, time, cfg)
+            mask = batch.get("mask")
+            mask = mask.to(DEVICE) if mask is not None else None
+            _, comps = total_loss_fn(pred, log_var, y, iso, time, cfg, mask=mask)
             losses.append(comps)
 
     return pd.DataFrame(losses).mean().to_dict()
@@ -1140,9 +1202,9 @@ def main():
         scaler=train_ds.scaler,
     )
 
-    train_loader = DataLoader(train_ds, batch_size=CFG.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=CFG.batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=CFG.batch_size, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=CFG.batch_size, shuffle=True, collate_fn=cure_collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=CFG.batch_size, shuffle=False, collate_fn=cure_collate_fn)
+    test_loader = DataLoader(test_ds, batch_size=CFG.batch_size, shuffle=False, collate_fn=cure_collate_fn)
 
     # ------------------------------------------------------------
     # Step 3: Train LSTM
