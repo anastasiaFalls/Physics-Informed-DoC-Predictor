@@ -1,5 +1,3 @@
-
-
 """
 Hybrid LSTM + Physics-Informed Research Prototype
 Real-time Degree of Cure (DoC) prediction using artificial RFID sensor data.
@@ -616,10 +614,20 @@ class CureSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         sid = self.sample_ids[idx]
-        g = self.df[self.df["sample_id"] == sid].sort_values("Time")
+        g = self.df[self.df["sample_id"] == sid].sort_values("Time").copy()
+
+        # Force all model columns to be numeric. This prevents object-dtype arrays
+        # from sneaking into PyTorch and causing dtype inference errors.
+        cols_to_numeric = list(self.feature_cols) + [self.target_col, self.reference_col, "Time", "Temperature"]
+        for col in cols_to_numeric:
+            g[col] = pd.to_numeric(g[col], errors="coerce")
+
+        # Drop any rows with missing model-critical values.
+        g = g.dropna(subset=cols_to_numeric)
 
         x = g[self.feature_cols].to_numpy(dtype=np.float32)
-        x = self.scaler.transform(x).astype(np.float32)
+        x = self.scaler.transform(x)
+        x = np.asarray(x, dtype=np.float32)
 
         y = g[self.target_col].to_numpy(dtype=np.float32).reshape(-1, 1)
         iso = g[self.reference_col].to_numpy(dtype=np.float32).reshape(-1, 1)
@@ -628,11 +636,11 @@ class CureSequenceDataset(Dataset):
 
         return {
             "sample_id": sid,
-            "x": torch.tensor(x),
-            "y": torch.tensor(y),
-            "iso": torch.tensor(iso),
-            "time": torch.tensor(time),
-            "temp": torch.tensor(temp),
+            "x": torch.from_numpy(x),
+            "y": torch.from_numpy(np.asarray(y, dtype=np.float32)),
+            "iso": torch.from_numpy(np.asarray(iso, dtype=np.float32)),
+            "time": torch.from_numpy(np.asarray(time, dtype=np.float32)),
+            "temp": torch.from_numpy(np.asarray(temp, dtype=np.float32)),
         }
 
 
@@ -1200,3 +1208,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
